@@ -26,6 +26,101 @@ async function delay(ms) {
   });
 }
 
+async function merge_and_rebase_merkle_trees(left_transaction, right_transaction) {
+  let left_size = parseInt(left_transaction.data_size);
+  let right_size = parseInt(right_transaction.data_size);
+  let rounded_left_size = Math.ceil(left_size / MAX_CHUNK_SIZE) * MAX_CHUNK_SIZE;
+  let tree_size = rounded_left_size + right_size;
+
+  let data_root = await Arweave.crypto.hash(Arweave.utils.concatBuffers([
+    await Arweave.crypto.hash(left_transaction.chunks.data_root),
+    await Arweave.crypto.hash(right_transaction.chunks.data_root),
+    await Arweave.crypto.hash(intToBuffer(rounded_left_size))
+  ]));
+
+  return new Transaction({
+    last_tx: await arweave.transactions.getTransactionAnchor(),
+    reward: await arweave.transactions.getPrice(tree_size),
+    data_size: tree_size.toString(),
+    data_root: Arweave.utils.bufferTob64Url(data_root),
+    chunks: {
+      data_root: data_root,
+      chunks: [],
+      proofs: []
+    }
+  });
+}
+
+async function get_rebased_proof(proof, subtree_root1, subtree_root2, subtree_size1) {
+  let rounded_size1 = Math.ceil(subtree_size1 / MAX_CHUNK_SIZE) * MAX_CHUNK_SIZE;
+  return Arweave.utils.concatBuffers([
+    REBASE_MARK,
+    subtree_root1,
+    subtree_root2,
+    intToBuffer(rounded_size1),
+    proof
+  ]);
+}
+
+async function rebase_proof(
+  merged_transaction, left_transaction, right_transaction, left_bound_shift, proof, chunk) {
+    let rebased_proof = await get_rebased_proof(
+      proof.proof,
+      left_transaction.chunks.data_root,
+      right_transaction.chunks.data_root,
+      parseInt(left_transaction.data_size)
+    );
+    chunk.minByteRange = left_bound_shift + chunk.minByteRange;
+    chunk.maxByteRange = left_bound_shift + chunk.maxByteRange;
+    merged_transaction.chunks.chunks.push(chunk);
+    merged_transaction.chunks.proofs.push({
+      proof: rebased_proof,
+      offset: left_bound_shift + proof.offset,
+    });
+}
+
+async function rebase_proofs(merged_transaction, left_transaction, right_transaction) {
+  let left_size = parseInt(left_transaction.data_size);
+  let right_size = parseInt(right_transaction.data_size);
+  let rounded_left_size = Math.ceil(left_size / MAX_CHUNK_SIZE) * MAX_CHUNK_SIZE;
+  let tree_size = rounded_left_size + right_size;
+
+  merged_transaction.data = Arweave.utils.concatBuffers([
+    left_transaction.data, right_transaction.data]);
+
+  let rebased_proofs = [];
+  for (let i = 0; i < left_transaction.chunks.proofs.length; i++) {
+    await rebase_proof(merged_transaction, left_transaction, right_transaction, 0,
+      left_transaction.chunks.proofs[i], left_transaction.chunks.chunks[i]);
+  }
+  for (let i = 0; i < right_transaction.chunks.proofs.length; i++) {
+    await rebase_proof(merged_transaction, left_transaction, right_transaction, left_size,
+      right_transaction.chunks.proofs[i], right_transaction.chunks.chunks[i]);
+  }
+}
+
+async function post_chunks(transaction) {
+  for (let i = 0; i < transaction.chunks.chunks.length; i++) {
+    let proof = transaction.chunks.proofs[i].proof;
+    let offset = transaction.chunks.proofs[i].offset;
+    let chunk = transaction.chunks.chunks[i];
+    let chunk_data = transaction.data.slice(chunk.minByteRange, chunk.maxByteRange);
+    let payload = {
+        data_root: transaction.data_root,
+        data_size: transaction.data_size,
+        data_path: Arweave.utils.bufferTob64Url(proof),
+        offset: offset.toString(),
+        chunk: Arweave.utils.bufferTob64Url(chunk_data),
+      };
+      console.log("post chunk " + i);
+      console.log(payload);
+      // let decoder = new TextDecoder('utf-8');
+      // let str = decoder.decode(chunk_data);
+      // console.log(str);
+      console.log(await arweave.api.post('chunk', payload));
+  }
+}
+
 (async function(){
   // 200 bytes
   const suffix = "01234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789";
@@ -33,49 +128,50 @@ async function delay(ms) {
     data: fs.readFileSync('lorem_524288.txt')
   });
   let transaction2 = await arweave.createTransaction({
-    data: "hello world1" + suffix
+    data: fs.readFileSync('lorem_262144.txt')
+    //data: "hello world1" + suffix
   });
 
+  console.log("transaction1");
   console.log(transaction1);
   console.log(transaction1.chunks);
+  console.log("transaction2");
   console.log(transaction2);
 
-  let [ data_root, tree_size ] = await merge_and_rebase_merkle_trees(
-    transaction1.chunks.data_root,
-    parseInt(transaction1.data_size),
-    transaction2.chunks.data_root,
-    parseInt(transaction2.data_size)
-  );
+  let merged_transaction = await merge_and_rebase_merkle_trees(transaction1, transaction2);
+  
+  await arweave.transactions.sign(merged_transaction, key);
+  console.log("merged_transaction");
+  console.log(merged_transaction);
+  console.log(await arweave.api.post('tx', merged_transaction));
 
-  let transaction3 = new Transaction({
-    last_tx: await arweave.transactions.getTransactionAnchor(),
-    reward: await arweave.transactions.getPrice(tree_size),
-    data_size: tree_size.toString(),
-    data_root: Arweave.utils.bufferTob64Url(data_root)
-  });
-  await arweave.transactions.sign(transaction3, key);
-  console.log(transaction3);
-  console.log(await arweave.api.post('tx', transaction3));
+  await rebase_proofs(merged_transaction, transaction1, transaction2);
+  console.log("merged_transaction");
+  console.log(merged_transaction);
+  console.log(merged_transaction.chunks.chunks);
+  console.log(merged_transaction.chunks.proofs);
 
-  const proof0 = await get_rebased_proof(
-    transaction1.chunks.proofs[0].proof,
-    transaction1.chunks.data_root,
-    transaction2.chunks.data_root,
-    parseInt(transaction1.data_size)
-  );
-  const offset0 = await get_rebased_offset(0, transaction1.chunks.proofs[0].offset);
-  const chunk0 = transaction1.chunks.chunks[0];
-  let payload = {
-    data_root: transaction3.data_root,
-    data_size: transaction3.data_size,
-    data_path: Arweave.utils.bufferTob64Url(proof0),
-    offset: offset0.toString(),
-    chunk: Arweave.utils.bufferTob64Url(
-      transaction1.data.slice(chunk0.minByteRange, chunk0.maxByteRange)
-    ),
-  };
-  console.log(payload);
-  console.log(await arweave.api.post('chunk', payload));
+  await post_chunks(merged_transaction);
+
+  // const proof0 = await get_rebased_proof(
+  //   transaction1.chunks.proofs[0].proof,
+  //   transaction1.chunks.data_root,
+  //   transaction2.chunks.data_root,
+  //   parseInt(transaction1.data_size)
+  // );
+  // const offset0 = await get_rebased_offset(0, transaction1.chunks.proofs[0].offset);
+  // const chunk0 = transaction1.chunks.chunks[0];
+  // let payload = {
+  //   data_root: transaction3.data_root,
+  //   data_size: transaction3.data_size,
+  //   data_path: Arweave.utils.bufferTob64Url(proof0),
+  //   offset: offset0.toString(),
+  //   chunk: Arweave.utils.bufferTob64Url(
+  //     transaction1.data.slice(chunk0.minByteRange, chunk0.maxByteRange)
+  //   ),
+  // };
+  // console.log(payload);
+  // console.log(await arweave.api.post('chunk', payload));
 
 
   // let tx_id = transaction3.id;
@@ -106,30 +202,7 @@ async function delay(ms) {
   // console.log("Poll complete. Tx seems published");
 })()
 
-async function merge_and_rebase_merkle_trees(data_root1, size1, data_root2, size2) {
-  let rounded_size1 = Math.ceil(size1 / MAX_CHUNK_SIZE) * MAX_CHUNK_SIZE;
-  let data_root = await Arweave.crypto.hash(Arweave.utils.concatBuffers([
-    await Arweave.crypto.hash(data_root1),
-    await Arweave.crypto.hash(data_root2),
-    await Arweave.crypto.hash(intToBuffer(size1))
-  ]));
-  return [data_root, rounded_size1 + size2];
-}
 
-async function get_rebased_proof(proof, subtree_root1, subtree_root2, subtree_size1) {
-  let rounded_size1 = Math.ceil(subtree_size1 / MAX_CHUNK_SIZE) * MAX_CHUNK_SIZE;
-  return Arweave.utils.concatBuffers([
-    subtree_root1,
-    subtree_root2,
-    intToBuffer(rounded_size1),
-    REBASE_MARK,
-    proof
-  ]);
-}
-
-async function get_rebased_offset(left_bound_shift, chunk_offset) {
-  return left_bound_shift + chunk_offset;
-}
 
 // (async function(){
 //   // 200 bytes
