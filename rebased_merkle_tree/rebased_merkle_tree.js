@@ -64,6 +64,7 @@ async function get_rebased_proof(proof, subtree_root1, subtree_root2, subtree_si
 
 async function rebase_proof(
   merged_transaction, left_transaction, right_transaction, left_bound_shift, proof, chunk) {
+    let rounded_left_size = Math.ceil(left_bound_shift / MAX_CHUNK_SIZE) * MAX_CHUNK_SIZE;
     let rebased_proof = await get_rebased_proof(
       proof.proof,
       left_transaction.chunks.data_root,
@@ -75,7 +76,7 @@ async function rebase_proof(
     merged_transaction.chunks.chunks.push(chunk);
     merged_transaction.chunks.proofs.push({
       proof: rebased_proof,
-      offset: left_bound_shift + proof.offset,
+      offset: rounded_left_size + proof.offset,
     });
 }
 
@@ -125,11 +126,12 @@ async function post_chunks(transaction) {
   // 200 bytes
   const suffix = "01234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789";
   let transaction1 = await arweave.createTransaction({
-    data: fs.readFileSync('lorem_524288.txt')
+    // data: fs.readFileSync('lorem_524288.txt')
+    data: fs.readFileSync('lorem_474000.txt')
   });
   let transaction2 = await arweave.createTransaction({
-    data: fs.readFileSync('lorem_262144.txt')
-    //data: "hello world1" + suffix
+    //data: fs.readFileSync('lorem_262144.txt')
+    data: "hello world1" + suffix
   });
 
   console.log("transaction1");
